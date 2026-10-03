@@ -34,6 +34,13 @@
   #status { color: var(--muted); font-size: 13px; min-height: 18px; }
   audio { width: 100%; margin: 8px 0; }
   .btns button { margin-right: 6px; }
+  #reader { position: fixed; left: 0; right: 0; top: 0; bottom: 0; background: var(--bg); display: none; flex-direction: column; z-index: 5;
+            padding-top: env(safe-area-inset-top, 0px); }
+  #rbar { display: flex; gap: 6px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  #rtitle { flex: 1; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #viewer { flex: 1; min-height: 0; position: relative; }
+  #rfoot { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-top: 1px solid var(--line); }
+  #player { z-index: 10; }
 </style>
 </head>
 <body>
@@ -61,6 +68,21 @@
   <div id="list"></div>
 </main>
 
+<div id="reader">
+  <div id="rbar">
+    <button onclick="closeReader()">Close</button>
+    <div id="rtitle"></div>
+    <button onclick="fontStep(-10)">A-</button>
+    <button onclick="fontStep(10)">A+</button>
+  </div>
+  <div id="viewer"></div>
+  <div id="rfoot">
+    <button onclick="if (rendition) rendition.prev()">Prev</button>
+    <span id="rprog"></span>
+    <button onclick="if (rendition) rendition.next()">Next</button>
+  </div>
+</div>
+
 <div id="player">
   <div class="inner">
     <div id="title"></div>
@@ -74,6 +96,8 @@
   </div>
 </div>
 
+<script src="jszip.min.js"></script>
+<script src="epub.min.js"></script>
 <script>
 var audio = document.getElementById('audio');
 function $(id) { return document.getElementById(id); }
@@ -150,7 +174,7 @@ async function loadFolder(path) {
       var n = nameOf(i.path);
       if (i.dir) addRow(list, n, 'folder', function () { loadFolder(i.path); });
       else if (AUDIO_EXT.test(i.path)) addRow(list, n, (i.size / 1048576).toFixed(0) + ' MB', function () { openAudio(i.path); });
-      else if (/\.epub$/i.test(i.path)) addRow(list, n, 'epub - reader coming in the next step', null, true);
+      else if (/\.epub$/i.test(i.path)) addRow(list, n, 'epub, ' + (i.size / 1048576).toFixed(1) + ' MB', function () { openEpub(i.path); });
     });
   } catch (e) {
     showMsg('Could not reach the server. Check the address in Settings.');
@@ -164,28 +188,37 @@ async function loadContinue() {
     var r = await fetch(api('pos'));
     if (!r.ok) return;
     var rows = await r.json();
-    rows.filter(function (x) { return x.kind === 'audio'; }).forEach(function (x) {
+    rows.forEach(function (x) {
       var pct = x.progress != null ? Math.round(x.progress * 100) + '%' : '';
-      addRow(box, nameOf(x.path), 'at ' + fmt(parseFloat(x.position)) + (pct ? ' (' + pct + ')' : ''), function () { openAudio(x.path); });
+      if (x.kind === 'audio') {
+        addRow(box, nameOf(x.path), 'audio, at ' + fmt(parseFloat(x.position)) + (pct ? ' (' + pct + ')' : ''), function () { openAudio(x.path); });
+      } else {
+        addRow(box, nameOf(x.path), 'epub' + (pct ? ', ' + pct : ''), function () { openEpub(x.path); });
+      }
     });
     if (!box.children.length) box.textContent = 'Nothing yet.';
   } catch (e) {}
 }
 
 /* ---------- audio ---------- */
-async function fetchPos(path) {
+async function fetchRow(path) {
   try {
     var r = await fetch(api('pos', { path: path }));
     var rows = await r.json();
-    if (rows[0] && rows[0].kind === 'audio') return parseFloat(rows[0].position) || 0;
+    return rows[0] || null;
   } catch (e) {}
-  return 0;
+  return null;
+}
+async function fetchPos(path) {
+  var row = await fetchRow(path);
+  return row && row.kind === 'audio' ? (parseFloat(row.position) || 0) : 0;
 }
 
 function openAudio(path) {
   currentPath = path;
   restored = false;
   $('player').style.display = 'block';
+  syncReaderInset();
   $('title').textContent = nameOf(path);
   $('status').textContent = 'Loading... the first start can take up to about 15 seconds.';
   var posP = fetchPos(path);
@@ -232,6 +265,111 @@ function cycleSpeed() {
   ri = (ri + 1) % rates.length;
   audio.playbackRate = rates[ri];
   $('sp').textContent = rates[ri];
+}
+
+/* ---------- epub reader ---------- */
+var book = null, rendition = null, epubPath = null, epubReady = false;
+var currentCfi = null, currentPct = null, lastESave = 0;
+var fontPct = parseInt(localStorage.getItem('fontPct') || '100', 10);
+
+function syncReaderInset() {
+  var p = $('player');
+  $('reader').style.bottom = (p.style.display === 'block' ? p.offsetHeight : 0) + 'px';
+  if (rendition) { try { rendition.resize(); } catch (e) {} }
+}
+
+async function openEpub(path) {
+  closeReader(true);
+  epubPath = path;
+  epubReady = false;
+  $('reader').style.display = 'flex';
+  syncReaderInset();
+  $('rtitle').textContent = nameOf(path).replace(/\.epub$/i, '');
+  $('rprog').textContent = 'Loading...';
+  try {
+    var rowP = fetchRow(path);
+    var r = await fetch(api('file', { path: path }));
+    if (!r.ok) throw new Error('file ' + r.status);
+    var buf = await r.arrayBuffer();
+    var row = await rowP;
+    var saved = row && row.kind === 'epub' ? row.position : undefined;
+
+    book = ePub(buf, { openAs: 'binary' });
+    rendition = book.renderTo('viewer', { width: '100%', height: '100%', flow: 'paginated', spread: 'none' });
+    applyTheme();
+    rendition.on('relocated', onRelocated);
+    rendition.on('keyup', keyNav);
+    var tx = null;
+    rendition.on('touchstart', function (e) { tx = e.changedTouches[0].screenX; });
+    rendition.on('touchend', function (e) {
+      if (tx === null) return;
+      var dx = e.changedTouches[0].screenX - tx; tx = null;
+      if (Math.abs(dx) > 50) { if (dx < 0) rendition.next(); else rendition.prev(); }
+    });
+    await rendition.display(saved);
+    epubReady = true;
+    $('rprog').textContent = '';
+    book.ready.then(function () { return book.locations.generate(1200); }).then(updateProgress).catch(function () {});
+  } catch (e) {
+    $('rprog').textContent = 'Could not open the book (' + e + ')';
+  }
+}
+
+function applyTheme() {
+  var cs = getComputedStyle(document.documentElement);
+  rendition.themes.default({
+    body: { color: cs.getPropertyValue('--fg').trim() + ' !important', background: cs.getPropertyValue('--bg').trim() + ' !important', 'line-height': '1.5' }
+  });
+  rendition.themes.fontSize(fontPct + '%');
+}
+
+function fontStep(d) {
+  fontPct = Math.min(200, Math.max(70, fontPct + d));
+  localStorage.setItem('fontPct', String(fontPct));
+  if (rendition) rendition.themes.fontSize(fontPct + '%');
+}
+
+function onRelocated(loc) {
+  currentCfi = loc.start.cfi;
+  updateProgress();
+  saveEpub(false);
+}
+
+function updateProgress() {
+  if (!book || !book.locations || !book.locations.length() || !currentCfi) return;
+  currentPct = book.locations.percentageFromCfi(currentCfi);
+  $('rprog').textContent = Math.round(currentPct * 100) + '%';
+}
+
+function saveEpub(force) {
+  if (!epubPath || !epubReady || !currentCfi) return;
+  var now = Date.now();
+  if (!force && now - lastESave < 3000) return;
+  lastESave = now;
+  fetch(api('pos'), {
+    method: 'POST',
+    keepalive: true,
+    body: JSON.stringify({ path: epubPath, kind: 'epub', position: currentCfi, progress: currentPct })
+  }).catch(function () {});
+}
+
+function keyNav(e) {
+  if (!rendition) return;
+  if (e.key === 'ArrowRight') rendition.next();
+  if (e.key === 'ArrowLeft') rendition.prev();
+}
+document.addEventListener('keyup', keyNav);
+window.addEventListener('resize', syncReaderInset);
+document.addEventListener('visibilitychange', function () { if (document.hidden) saveEpub(true); });
+
+function closeReader(silent) {
+  saveEpub(true);
+  try { if (rendition) rendition.destroy(); } catch (e) {}
+  try { if (book) book.destroy(); } catch (e) {}
+  rendition = null; book = null; epubPath = null; epubReady = false; currentCfi = null; currentPct = null;
+  $('viewer').innerHTML = '';
+  $('reader').style.display = 'none';
+  if (!silent) loadContinue();
 }
 
 /* ---------- start ---------- */
