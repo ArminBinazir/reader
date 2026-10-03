@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Reader</title>
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1c1a; --muted: #77746d; --line: #e4e1da; --card: #ffffff; --accent: #2f5d50;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --fg: #ecebe7; --muted: #9a978f; --line: #2b2a28; --card: #1e1d1b; --accent: #7fb5a3; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, sans-serif; line-height: 1.4; }
+  main { max-width: 640px; margin: 0 auto; padding: 16px 16px 220px; }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 22px 0 6px; }
+  button { font: inherit; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  input { font: inherit; width: 100%; padding: 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); margin: 4px 0 12px; }
+  .row { padding: 12px 4px; border-bottom: 1px solid var(--line); cursor: pointer; word-break: break-word; }
+  .row small { display: block; color: var(--muted); }
+  .row.disabled { opacity: .45; cursor: default; }
+  #crumb { color: var(--muted); font-size: 14px; word-break: break-all; }
+  #settings { display: none; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 14px; }
+  #player { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line);
+            padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); display: none; }
+  #player .inner { max-width: 640px; margin: 0 auto; }
+  #title { font-weight: 600; word-break: break-word; }
+  #status { color: var(--muted); font-size: 13px; min-height: 18px; }
+  audio { width: 100%; margin: 8px 0; }
+  .btns button { margin-right: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Reader</h1>
+    <button onclick="toggleSettings()">Settings</button>
+  </header>
+
+  <div id="settings">
+    <label>Server address (ends with /reader)</label>
+    <input id="base" placeholder="https://YOUR-PROJECT-REF.supabase.co/functions/v1/reader" autocapitalize="off" autocorrect="off">
+    <label>Access key</label>
+    <input id="key" type="password" placeholder="Your APP_TOKEN" autocapitalize="off" autocorrect="off">
+    <button class="primary" onclick="saveSettings()">Save</button>
+  </div>
+
+  <div id="msg" style="color:#b3261e"></div>
+
+  <h2>Continue</h2>
+  <div id="continue"></div>
+
+  <h2>Library</h2>
+  <div id="crumb"></div>
+  <div id="list"></div>
+</main>
+
+<div id="player">
+  <div class="inner">
+    <div id="title"></div>
+    <div id="status"></div>
+    <audio id="audio" controls preload="metadata" playsinline></audio>
+    <div class="btns">
+      <button onclick="skip(-30)">Back 30s</button>
+      <button onclick="skip(30)">Forward 30s</button>
+      <button onclick="cycleSpeed()">Speed <span id="sp">1</span>x</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var audio = document.getElementById('audio');
+function $(id) { return document.getElementById(id); }
+
+var cfg = { base: localStorage.getItem('base') || '', key: localStorage.getItem('key') || '' };
+var currentPath = null;
+var restored = false;
+var lastSave = 0;
+var AUDIO_EXT = /\.(mp3|m4b|m4a|ogg|opus)$/i;
+
+function api(route, params) {
+  var u = new URL(cfg.base.replace(/\/+$/, '') + '/' + route);
+  for (var k in (params || {})) u.searchParams.set(k, params[k]);
+  u.searchParams.set('key', cfg.key);
+  return u.toString();
+}
+
+function nameOf(p) {
+  var parts = p.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '/';
+}
+
+function fmt(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  var mm = (h ? String(m).padStart(2, '0') : m), ss = String(s).padStart(2, '0');
+  return (h ? h + ':' : '') + mm + ':' + ss;
+}
+
+function showMsg(t) { $('msg').textContent = t || ''; }
+
+/* ---------- settings ---------- */
+function toggleSettings() {
+  var s = $('settings');
+  s.style.display = s.style.display === 'block' ? 'none' : 'block';
+  $('base').value = cfg.base;
+  $('key').value = cfg.key;
+}
+function saveSettings() {
+  cfg.base = $('base').value.trim();
+  cfg.key = $('key').value.trim();
+  localStorage.setItem('base', cfg.base);
+  localStorage.setItem('key', cfg.key);
+  $('settings').style.display = 'none';
+  start();
+}
+
+/* ---------- library ---------- */
+function addRow(parent, title, sub, fn, disabled) {
+  var d = document.createElement('div');
+  d.className = 'row' + (disabled ? ' disabled' : '');
+  d.textContent = title;
+  if (sub) { var s = document.createElement('small'); s.textContent = sub; d.appendChild(s); }
+  if (!disabled) d.onclick = fn;
+  parent.appendChild(d);
+}
+
+async function loadFolder(path) {
+  showMsg('');
+  $('crumb').textContent = path;
+  var list = $('list');
+  list.innerHTML = '';
+  try {
+    var r = await fetch(api('list', { path: path }));
+    if (!r.ok) { showMsg('Could not load the library (error ' + r.status + '). Check Settings.'); return; }
+    var items = await r.json();
+    if (path !== '/') {
+      var parts = path.split('/').filter(Boolean); parts.pop();
+      var up = parts.length ? '/' + parts.join('/') + '/' : '/';
+      addRow(list, '.. up one folder', '', function () { loadFolder(up); });
+    }
+    items.sort(function (a, b) { return (b.dir - a.dir) || a.path.localeCompare(b.path); });
+    items.forEach(function (i) {
+      var n = nameOf(i.path);
+      if (i.dir) addRow(list, n, 'folder', function () { loadFolder(i.path); });
+      else if (AUDIO_EXT.test(i.path)) addRow(list, n, (i.size / 1048576).toFixed(0) + ' MB', function () { openAudio(i.path); });
+      else if (/\.epub$/i.test(i.path)) addRow(list, n, 'epub - reader coming in the next step', null, true);
+    });
+  } catch (e) {
+    showMsg('Could not reach the server. Check the address in Settings.');
+  }
+}
+
+async function loadContinue() {
+  var box = $('continue');
+  box.innerHTML = '';
+  try {
+    var r = await fetch(api('pos'));
+    if (!r.ok) return;
+    var rows = await r.json();
+    rows.filter(function (x) { return x.kind === 'audio'; }).forEach(function (x) {
+      var pct = x.progress != null ? Math.round(x.progress * 100) + '%' : '';
+      addRow(box, nameOf(x.path), 'at ' + fmt(parseFloat(x.position)) + (pct ? ' (' + pct + ')' : ''), function () { openAudio(x.path); });
+    });
+    if (!box.children.length) box.textContent = 'Nothing yet.';
+  } catch (e) {}
+}
+
+/* ---------- audio ---------- */
+async function fetchPos(path) {
+  try {
+    var r = await fetch(api('pos', { path: path }));
+    var rows = await r.json();
+    if (rows[0] && rows[0].kind === 'audio') return parseFloat(rows[0].position) || 0;
+  } catch (e) {}
+  return 0;
+}
+
+function openAudio(path) {
+  currentPath = path;
+  restored = false;
+  $('player').style.display = 'block';
+  $('title').textContent = nameOf(path);
+  $('status').textContent = 'Loading... the first start can take up to about 15 seconds.';
+  var posP = fetchPos(path);
+
+  audio.src = api('file', { path: path });
+  audio.onloadedmetadata = async function () {
+    var s = await posP;
+    if (s > 0 && Math.abs(audio.currentTime - s) > 1) audio.currentTime = s;
+    restored = true;
+    $('status').textContent = s > 0 ? 'Resumed at ' + fmt(s) : '';
+  };
+  // play() is called right in the tap, which iOS requires
+  audio.play().catch(function () { $('status').textContent = 'Tap play to start.'; });
+
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: nameOf(path).replace(/\.[^.]+$/, '') });
+    navigator.mediaSession.setActionHandler('seekbackward', function () { skip(-30); });
+    navigator.mediaSession.setActionHandler('seekforward', function () { skip(30); });
+  }
+}
+
+function savePos(force) {
+  if (!currentPath || !restored || !isFinite(audio.duration) || audio.duration <= 0) return;
+  var now = Date.now();
+  if (!force && now - lastSave < 10000) return;
+  lastSave = now;
+  fetch(api('pos'), {
+    method: 'POST',
+    keepalive: true,
+    body: JSON.stringify({ path: currentPath, kind: 'audio', position: audio.currentTime, progress: audio.currentTime / audio.duration })
+  }).catch(function () {});
+}
+
+audio.addEventListener('timeupdate', function () { savePos(false); });
+audio.addEventListener('pause', function () { savePos(true); });
+audio.addEventListener('ended', function () { savePos(true); });
+audio.addEventListener('error', function () { if (currentPath) $('status').textContent = 'Playback error. Check the address and key in Settings.'; });
+document.addEventListener('visibilitychange', function () { if (document.hidden) savePos(true); });
+
+function skip(d) { audio.currentTime = Math.max(0, audio.currentTime + d); }
+
+var rates = [1, 1.25, 1.5, 1.75, 2, 0.75], ri = 0;
+function cycleSpeed() {
+  ri = (ri + 1) % rates.length;
+  audio.playbackRate = rates[ri];
+  $('sp').textContent = rates[ri];
+}
+
+/* ---------- start ---------- */
+function start() {
+  if (!cfg.base || !cfg.key) { toggleSettings(); return; }
+  loadContinue();
+  loadFolder('/');
+}
+start();
+</script>
+</body>
+</html>
